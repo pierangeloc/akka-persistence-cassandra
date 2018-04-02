@@ -2,10 +2,10 @@ package io.tuliplogic.akka
 
 import java.util.UUID
 
-import akka.actor.Actor
+import akka.actor.ActorLogging
 import akka.persistence.PersistentActor
+import io.tuliplogic.akka.approvalmodel.{ApprovalRequest, Command, Event}
 import io.tuliplogic.akka.approvalmodel.ApprovalStatus.Pending
-import io.tuliplogic.akka.approvalmodel.Event.RequestCreated
 
 /**
   *
@@ -36,9 +36,9 @@ object approvalmodel {
   }
 
   case class ApproverName(name: String)
-  case class ApprovalRequestId(id: UUID)
+  case class ApprovalRequestId(id: String)
   object ApprovalRequestId {
-    def create = ApprovalRequestId(UUID.randomUUID)
+    def create = ApprovalRequestId(UUID.randomUUID.toString)
   }
 
   case class Approver(name: ApproverName, approvalStatus: ApprovalStatus = Pending)
@@ -71,7 +71,7 @@ object approvalmodel {
   }
 
   object ApprovalRequest extends EventSourcing[ApprovalRequest, Command, Event] {
-    def create = ApprovalRequest(ApprovalRequestId.create, Map())
+    def create(approvalRequestId: ApprovalRequestId) = ApprovalRequest(approvalRequestId, Map())
 
     def approver(name: ApproverName)(request: ApprovalRequest): Either[String, Approver] = request.approvers.get(name).toRight("Approver does not exist")
     def contains(name: ApproverName)(request: ApprovalRequest): Boolean = approver(name)(request).isRight
@@ -127,22 +127,45 @@ object approvalmodel {
 
       case (Event.CancellationSucceeded(_, approverName), Some(approvalRequest)) => ApprovalRequest.cancel(approverName)(approvalRequest)
       case (Event.CancellationFailed(_, _), Some(approvalRequest)) => Right(approvalRequest) // failed is absorbed and won't change the stat
-
-      case _ => Left(s"Could not apply event $evt to approval request $optRequest")
-
     }
   }
 }
 
 object ApprovalRequestsRepository {
-  def apply() = Persistent
+  def create() = {
+
+
+  }
 }
 
-class ApprovalRequestActor extends PersistentActor {
+class ApprovalRequestActor extends PersistentActor with ActorLogging {
 
-  override def receiveRecover: Receive = ???
+  override def receiveRecover: Receive = handleRecover(None)
 
-  override def receiveCommand: Receive = ???
+  override def receiveCommand: Receive = handleCommand(None)
 
-  override def persistenceId: String = "approval-request"
+  def handleCommand(request: Option[ApprovalRequest]): Receive = {
+    case c: Command => ApprovalRequest.applyCommand(c)(request) match {
+      case Left(error) => log.error(s"Error applying command $error")
+      case Right(event) =>
+        ApprovalRequest.applyEvent(event)(request) match {
+          case Right(updatedRequest) =>
+            persist(event)
+            context.become(handleCommand(Some(updatedRequest)))
+          case _ => ()
+
+        }
+    }
+  }
+
+  def handleRecover(request: Option[ApprovalRequest]): Receive = {
+    case e: Event =>
+      ApprovalRequest.applyEvent(e)(request) match {
+        case Right(updatedRequest) =>
+          context.become(handleRecover(Some(updatedRequest)))
+        case _ => ()
+      }
+  }
+
+  override def persistenceId: String = s"approval-request-${self.path.name}"
 }
